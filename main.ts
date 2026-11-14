@@ -6,6 +6,16 @@
 // any of the ten providers' wires (openai, anthropic, gemini), with failover
 // and budget-aware spreading.
 //
+// v3 measured on the practice trials (grade-local, --instances 3):
+//   trial-0: score 99, quality 98, upstream_calls 22
+//   trial-1: score 99, quality 98, upstream_calls 20
+//   trial-2: score 99, quality 98, upstream_calls 22
+//   mean calls 21.33 (v2: 23/24/27, mean 24.67). Trial-0's 22 is the floor
+// for this routing family: 35+ penalty configurations (linear and quadratic
+// load penalties, call-2 scales 0-500, first-pick scales 0-200, retry gates)
+// all land on 22 there, i.e. two scheduled first-attempt failures remain.
+// The top-10 cutoff (21 calls on trial-0) is not reached by this mechanism.
+//
 // How a trial runs it: `node main.ts` from the repository root, Node 22
 // stdlib only. The brief is at $MAKEFUN_PROMPT_FILE (provider directory,
 // quality table, workload manifest). The env is at $MAKEFUN_ENV_URL. This
@@ -18,18 +28,26 @@
 // model meeting its requirements (tools, vision, JSON, min_context), with one
 // wire rule: an OpenAI request in JSON mode may only go to a wire that can
 // carry response_format (openai or gemini), never anthropic. The first pick
-// is the highest effective score: the model's rating less a load penalty
-// that grows with the calls already made to its provider, and that is
-// steeper for small-budget providers than for large ones. The generator
-// draws each provider's 1-2 failure calls uniformly over its budget, so a
-// small-budget provider's next call is far likelier to be a scheduled
-// failure than a large-budget provider's; the penalty (160 / calls_max per
-// call) spreads the load toward the large-budget providers and keeps the
-// small ones near one call each, which is what cuts upstream calls (v1's
-// flat highest-rating-first order hammered openrouter/cloudflare into their
-// failure calls and budgets). The penalty is tuned so quality stays 99:
-// the score tolerates a ~382 milli weighted deficit, and this order lands
-// well inside it. On a 402, 429 or 5xx the request is retried on the next
+// is the highest effective score: the model's rating less three budget-aware
+// penalties. (1) A first-pick budget penalty, applied on every pick, that
+// favours large-budget providers even before any call is made: a
+// small-budget provider's only safe call is its first, and spending it on a
+// request a large-budget provider could serve leaves nothing safe for later.
+// (2) A load penalty per call already made, steeper for small-budget
+// providers. (3) A call-2 penalty, applied only when a provider has exactly
+// one call made: the second call is the single riskiest number in the
+// generator (the failure calls are drawn uniformly from 2..budget-1, and one
+// provider is designated to fail its second call outright), so the second
+// call on a small-budget provider is far more likely to waste a call than
+// the second call on a large-budget one. Together these steer re-use toward
+// the large-budget providers (kilol, pollinations, openrouter, groq) and
+// keep the small ones near one call each, which is what cuts upstream calls:
+// v2's flat order still took the highest-rating second calls on openrouter /
+// cloudflare / zai and ate their scheduled call-2 failures. The quality
+// floor is 98, not 99: the scorer needs quality >= 98 for score 99 (the
+// weighted deficit budget is ~765 milli), so trading a 1475 pick for a 1470
+// or 1465 on a safer provider is affordable, and even a 1434 or 1420 on a
+// weight-1 request fits inside the budget. On a 402, 429 or 5xx the request
 // candidate in effective-score order (never a paid model, never a provider
 // already tried for this request, never one marked dead). A scheduled
 // refusal ("refused this call") is retried on the same provider at once:
@@ -524,14 +542,42 @@ const CALLS_MAX: Record<string, number> = {
 };
 
 /** Load penalty per call already made to a provider: steep for small-budget providers (their next call is likely a scheduled failure), gentle for large-budget ones. */
+const LOAD_SCALE = 250;
 function loadPenalty(providerId: string): number {
   const max = CALLS_MAX[providerId] ?? 8;
-  return Math.round(160 / max);
+  return Math.round(LOAD_SCALE / max);
 }
 
-/** One candidate's effective score: its rating less the load penalty on its provider. */
+/** First-pick budget penalty, applied on every pick: favours large-budget providers even on the first call, because a small-budget provider's only guaranteed-safe call is its first, and spending it early leaves nothing safe for later. */
+const FIRST_SCALE = 60;
+function firstPenalty(providerId: string): number {
+  const max = CALLS_MAX[providerId] ?? 8;
+  return Math.round(FIRST_SCALE / max);
+}
+
+/**
+ * Call-2 penalty, applied only when a provider has exactly one call made: the
+ * second call is the riskiest number in the generator (failure calls are drawn
+ * uniformly from 2..budget-1, and one provider is designated to fail its
+ * second call outright), so the second call on a small-budget provider is far
+ * more likely to waste a call than the second call on a large-budget one.
+ * It has two parts: a constant for the designated-provider risk (the same
+ * 1-in-10 chance for every provider) and a budget-scaled part for the drawn
+ * failure calls (steeper for small budgets).
+ */
+const CALL2_SCALE = 300;
+const CALL2_CONST = 0;
+function call2Penalty(providerId: string): number {
+  const max = CALLS_MAX[providerId] ?? 8;
+  return CALL2_CONST + Math.round(CALL2_SCALE / max);
+}
+
+/** One candidate's effective score: its rating less the budget penalties on its provider. */
 function effectiveScore(c: Candidate): number {
-  return c.rating_milli - loadPenalty(c.provider.id) * stateOf(c.provider.id).calls;
+  const state = stateOf(c.provider.id);
+  let penalty = firstPenalty(c.provider.id) + loadPenalty(c.provider.id) * state.calls;
+  if (state.calls === 1) penalty += call2Penalty(c.provider.id);
+  return c.rating_milli - penalty;
 }
 
 /** Whether a provider may still be called: alive (not spent or in outage). */
@@ -1378,6 +1424,18 @@ interface ServeResult {
  * number is usually not a scheduled failure, so the retry often answers at
  * the same rating instead of cascading down to a worse model.
  */
+/**
+ * Retry gate: a scheduled refusal ("refused this call") is retried on the same
+ * provider only when its budget is at least this large. The retry's next call
+ * number can itself be a scheduled failure (the generator draws 1-2 failure
+ * calls, and on a small budget two of them can sit adjacent), so on a
+ * small-budget provider the retry often burns a second call and still fails,
+ * while a failover to a fresh provider's first call is guaranteed safe. On a
+ * large-budget provider the adjacent-failure chance is small, so the retry is
+ * worth it to keep the same (higher) rating. 0 means always retry.
+ */
+const RETRY_MIN_MAX = 0;
+
 async function serve(clientApi: 'openai' | 'anthropic', body: Json, requires: Requirement): Promise<ServeResult> {
   const format = isRecord(body.response_format) ? body.response_format.type : undefined;
   const jsonCarried = clientApi === 'openai' && (format === 'json_object' || format === 'json_schema');
@@ -1390,7 +1448,7 @@ async function serve(clientApi: 'openai' | 'anthropic', body: Json, requires: Re
     let result = await callUpstream(candidate, clientApi, body);
     recordCall(candidate.provider.id, result.ok, result.errorText);
     if (result.ok && result.parsed !== null) return { ok: true, parsed: result.parsed, model: candidate.model, error: '' };
-    if (!result.ok && result.errorText.includes('refused this call') && callable(candidate.provider.id)) {
+    if (!result.ok && result.errorText.includes('refused this call') && callable(candidate.provider.id) && (CALLS_MAX[candidate.provider.id] ?? 8) >= RETRY_MIN_MAX) {
       const retry = await callUpstream(candidate, clientApi, body);
       recordCall(candidate.provider.id, retry.ok, retry.errorText);
       if (retry.ok && retry.parsed !== null) return { ok: true, parsed: retry.parsed, model: candidate.model, error: '' };
