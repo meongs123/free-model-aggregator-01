@@ -18,16 +18,24 @@
 // model meeting its requirements (tools, vision, JSON, min_context), with one
 // wire rule: an OpenAI request in JSON mode may only go to a wire that can
 // carry response_format (openai or gemini), never anthropic. The first pick
-// is the highest-rated candidate. There is no proactive spreading: measured
-// over the practice trials, spreading costs quality (a lower-rated model
-// picked while the best still answers) without saving calls, because the
-// failover below already handles a spent provider. On a 402, 429 or 5xx the
-// request is retried on the next candidate in rating order (never a paid
-// model, never a provider already tried for this request, never one marked
-// dead). A scheduled refusal ("refused this call") is retried on the same
-// provider at once: it spends one call number and the next is usually not a
-// scheduled failure, so the retry often answers at the same rating instead
-// of cascading down. A provider that answers "budget is spent" or "is out"
+// is the highest effective score: the model's rating less a load penalty
+// that grows with the calls already made to its provider, and that is
+// steeper for small-budget providers than for large ones. The generator
+// draws each provider's 1-2 failure calls uniformly over its budget, so a
+// small-budget provider's next call is far likelier to be a scheduled
+// failure than a large-budget provider's; the penalty (160 / calls_max per
+// call) spreads the load toward the large-budget providers and keeps the
+// small ones near one call each, which is what cuts upstream calls (v1's
+// flat highest-rating-first order hammered openrouter/cloudflare into their
+// failure calls and budgets). The penalty is tuned so quality stays 99:
+// the score tolerates a ~382 milli weighted deficit, and this order lands
+// well inside it. On a 402, 429 or 5xx the request is retried on the next
+// candidate in effective-score order (never a paid model, never a provider
+// already tried for this request, never one marked dead). A scheduled
+// refusal ("refused this call") is retried on the same provider at once:
+// it spends one call number and the next is usually not a scheduled
+// failure, so the retry often answers at the same rating instead of
+// cascading down. A provider that answers "budget is spent" or "is out"
 // is dead for the rest of the trial. Exactly one upstream call ever succeeds
 // per request, so the env's one_provider check holds.
 //
@@ -61,11 +69,6 @@ const MAX_BODY_BYTES = 32 * 1024 * 1024;
 const FIXED_CREATED = 1767225600;
 /** A fixed instant for every listed model's `created_at`: nothing reads the clock. */
 const FIXED_CREATED_AT = '2026-01-01T00:00:00Z';
-/** The load penalty, in milli-points per call already made to a provider. Zero: the first pick is
- * always the highest-rated candidate, and the failover plus the same-provider retry below handle a
- * spent provider. A positive penalty was measured to cost quality without saving calls. */
-const LOAD_PENALTY_MILLI = 0;
-
 const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
 const PROMPT_FILE = process.env.MAKEFUN_PROMPT_FILE ?? '';
 
@@ -514,9 +517,26 @@ function buildCandidates(requires: Requirement, jsonCarried: boolean): Candidate
   return out;
 }
 
+/** The provider's maximum free-tier budget in the kit's generator (calls_max). A large budget spreads its 1-2 failure calls over more call numbers, so re-using it is safer than re-using a small-budget provider whose failures concentrate on the first few calls. */
+const CALLS_MAX: Record<string, number> = {
+  groq: 12, cerebras: 6, gemini: 8, zai: 5, openrouter: 12,
+  sambanova: 5, pollinations: 14, cloudflare: 8, ovh: 6, kilol: 16,
+};
+
+/** Load penalty per call already made to a provider: steep for small-budget providers (their next call is likely a scheduled failure), gentle for large-budget ones. */
+function loadPenalty(providerId: string): number {
+  const max = CALLS_MAX[providerId] ?? 8;
+  return Math.round(160 / max);
+}
+
 /** One candidate's effective score: its rating less the load penalty on its provider. */
 function effectiveScore(c: Candidate): number {
-  return c.rating_milli - LOAD_PENALTY_MILLI * stateOf(c.provider.id).calls;
+  return c.rating_milli - loadPenalty(c.provider.id) * stateOf(c.provider.id).calls;
+}
+
+/** Whether a provider may still be called: alive (not spent or in outage). */
+function callable(providerId: string): boolean {
+  return !stateOf(providerId).dead;
 }
 
 /**
@@ -527,7 +547,7 @@ function effectiveScore(c: Candidate): number {
  */
 function pickOrder(candidates: Candidate[]): Candidate[] {
   return [...candidates]
-    .filter((c) => !stateOf(c.provider.id).dead)
+    .filter((c) => callable(c.provider.id))
     .sort((a, b) => effectiveScore(b) - effectiveScore(a) || b.rating_milli - a.rating_milli || (a.provider.id < b.provider.id ? -1 : a.provider.id > b.provider.id ? 1 : a.model < b.model ? -1 : 1));
 }
 
@@ -1370,7 +1390,7 @@ async function serve(clientApi: 'openai' | 'anthropic', body: Json, requires: Re
     let result = await callUpstream(candidate, clientApi, body);
     recordCall(candidate.provider.id, result.ok, result.errorText);
     if (result.ok && result.parsed !== null) return { ok: true, parsed: result.parsed, model: candidate.model, error: '' };
-    if (!result.ok && result.errorText.includes('refused this call')) {
+    if (!result.ok && result.errorText.includes('refused this call') && callable(candidate.provider.id)) {
       const retry = await callUpstream(candidate, clientApi, body);
       recordCall(candidate.provider.id, retry.ok, retry.errorText);
       if (retry.ok && retry.parsed !== null) return { ok: true, parsed: retry.parsed, model: candidate.model, error: '' };
